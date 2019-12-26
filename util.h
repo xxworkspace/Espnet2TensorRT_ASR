@@ -1,6 +1,6 @@
 #pragma once
 
-
+#include <vector>
 #include <string>
 #include <cassert>
 #include <fstream>
@@ -9,25 +9,34 @@
 
 using namespace nvinfer1;
 
-char* fromFile(std::string file,size_t size) {
-  std::ifstream ifs(file,std::ios::binary);
+void logTensorInfo(ITensor* tensor, std::string name) {
+  Dims dims = tensor->getDimensions();
+  std::cout << name << " -> ";
+  for (int i = 0; i < dims.nbDims; ++i)
+    std::cout << dims.d[i] << " ";
+  std::cout << std::endl;
+}
+
+char* fromFile(std::string file, size_t size) {
+  std::cout << "loading weight from " << file << std::endl;
+  std::ifstream ifs(file, std::ios::binary);
   if (ifs.fail()) {
-    std::cout << file <<" open fail!"<<std::endl;
+    std::cout << file << " open fail!" << std::endl;
     exit(0);
   }
-  ifs.seekg(0,std::ios::end);
+  ifs.seekg(0, std::ios::end);
   size_t len = ifs.tellg();
-  ifs.seekg(0,std::ios::beg);
+  ifs.seekg(0, std::ios::beg);
   assert(len == size);
   char* tmp_ptr = (char*)malloc(len);
-  ifs.read(tmp_ptr,len);
+  ifs.read(tmp_ptr, len);
   ifs.close();
   return tmp_ptr;
 }
 
-Weights getWeight(std::string file,size_t size) {
+Weights getWeight(std::string file, size_t size) {
   char*tmp = fromFile(file, size);
-  Weights weight{ DataType::kFLOAT,tmp,(int64_t)size / sizeof(float) };
+  Weights weight{ DataType::kFLOAT, tmp,(int64_t)size / sizeof(float) };
   return weight;
 }
 
@@ -62,14 +71,14 @@ ITensor* FC(
   const int outsize,
   std::string prefix) {
 
-  Weights weight = getWeight(prefix + "weight", insize*outsize * sizeof(float));
-  Weights bias = getWeight(prefix + "bais", outsize * sizeof(float));
+  Weights weight = getWeight(prefix + ".weight", insize*outsize * sizeof(float));
+  Weights bias = getWeight(prefix + ".bias", outsize * sizeof(float));
 
   auto w = network->addConstant(DimsHW(outsize, insize), weight)->getOutput(0);
-  auto b = network->addConstant(DimsHW(1,outsize),bias)->getOutput(0);
+  auto b = network->addConstant(DimsHW(1, outsize), bias)->getOutput(0);
 
-  auto fc = network->addMatrixMultiply(input, MatrixOperation::kNONE, *w, MatrixOperation::kTRANSPOSE)->getOutput(0);
-  auto fb = network->addElementWise(*fc,*b,ElementWiseOperation::kSUM)->getOutput(0);
+  auto fc = network->addMatrixMultiply(*input, MatrixOperation::kNONE, *w, MatrixOperation::kTRANSPOSE)->getOutput(0);
+  auto fb = network->addElementWise(*fc, *b, ElementWiseOperation::kSUM)->getOutput(0);
 
   return fb;
 }
@@ -80,15 +89,15 @@ ITensor* LayerNormalization(
   const int odim,
   std::string prefix) {
 
-  auto gamma = getWeight(prefix + "weight", odim * sizeof(float));
-  auto beta = getWeight(prefix + "bias", odim * sizeof(float));
+  auto gamma = getWeight(prefix + ".weight", odim * sizeof(float));
+  auto beta = getWeight(prefix + ".bias", odim * sizeof(float));
 
   std::vector<PluginField> vpf{
     PluginField("gamma",gamma.values,PluginFieldType::kFLOAT32,(int32_t)gamma.count),
     PluginField("beta",beta.values,PluginFieldType::kFLOAT32,(int32_t)beta.count)
   };
 
-  PluginFieldCollection pfc{vpf.size(),vpf.data()};
+  PluginFieldCollection pfc{ vpf.size(),vpf.data() };
   auto creator = getPluginRegistry()->getPluginCreator(
     "LayerNormalization_TRT", "001", "");
   IPluginV2 *plugin = creator->createPlugin("", &pfc);
@@ -103,9 +112,9 @@ ITensor* FeedForward(
   const int feed,
   std::string prefix) {
 
-  auto fc1 = FC(network, input, odim, feed, prefix + "feed_forward.w_1.");
+  auto fc1 = FC(network, input, odim, feed, prefix + ".feed_forward.w_1");
   auto fb1 = network->addActivation(*fc1, ActivationType::kRELU)->getOutput(0);
-  auto fc2 = FC(network, fb1, feed, odim, prefix + "feed_forward.w_2.");
+  auto fc2 = FC(network, fb1, feed, odim, prefix + ".feed_forward.w_2");
 
   return fc2;
 }
@@ -115,15 +124,16 @@ ITensor* SelfAttention(
   ITensor* input,
   const int n_Head,
   const int odim,
+  const int mask,
   std::string prefix) {
 
-  auto q = FC(network, input, odim, odim, prefix + "self_attn.linear_q.");
-  auto k = FC(network, input, odim, odim, prefix + "self_attn.linear_k.");
-  auto v = FC(network, input, odim, odim, prefix + "self_attn.linear_v.");
+  auto q = FC(network, input, odim, odim, prefix + ".self_attn.linear_q");
+  auto k = FC(network, input, odim, odim, prefix + ".self_attn.linear_k");
+  auto v = FC(network, input, odim, odim, prefix + ".self_attn.linear_v");
 
-  int data[] = { n_Head, odim };
+  int data[] = { n_Head, odim , mask };
   std::vector<PluginField> vpf{
-    PluginField("args",data,PluginFieldType::kFLOAT32,(int32_t)2)
+    PluginField("args",data,PluginFieldType::kFLOAT32,(int32_t)3)
   };
 
   PluginFieldCollection pfc{ vpf.size(),vpf.data() };
@@ -133,7 +143,7 @@ ITensor* SelfAttention(
   std::vector<ITensor*> vit{ q,k,v };
   auto bottom = network->addPluginV2(vit.data(), vit.size(), *plugin)->getOutput(0);
 
-  auto out = FC(network, input, odim, odim, prefix + "self_attn.linear_out.");
+  auto out = FC(network, input, odim, odim, prefix + ".self_attn.linear_out");
   return out;
 }
 
@@ -144,18 +154,18 @@ ITensor* SrcAttention(
   const int odim,
   const DataType dtype,
   std::string prefix) {
-  auto q = FC(network, input, odim, odim, prefix + "src_attn.linear_q.");
+  auto q = FC(network, input, odim, odim, prefix + ".src_attn.linear_q");
 
   int data[] = { n_Head, odim ,(int)dtype };
 
-  auto kWeight = getWeight(prefix + "src_attn.linear_k.weight",odim*odim*sizeof(float));
-  auto kBias = getWeight(prefix + "src_attn.linear_k.bais", odim * sizeof(float));
+  auto kWeight = getWeight(prefix + ".src_attn.linear_k.weight", odim*odim * sizeof(float));
+  auto kBias = getWeight(prefix + ".src_attn.linear_k.bias", odim * sizeof(float));
 
-  auto vWeight = getWeight(prefix + "src_attn.linear_v.weight", odim*odim * sizeof(float));
-  auto vBias = getWeight(prefix + "src_attn.linear_v.bais", odim * sizeof(float));
+  auto vWeight = getWeight(prefix + ".src_attn.linear_v.weight", odim*odim * sizeof(float));
+  auto vBias = getWeight(prefix + ".src_attn.linear_v.bias", odim * sizeof(float));
 
   std::vector<PluginField> vpf{
-    PluginField("args",data,PluginFieldType::kFLOAT32,(int32_t)2),
+    PluginField("args",data,PluginFieldType::kFLOAT32,(int32_t)3),
     PluginField("kweight",kWeight.values,PluginFieldType::kFLOAT32,(int32_t)kWeight.count),
     PluginField("kbias",kBias.values,PluginFieldType::kFLOAT32,(int32_t)kBias.count),
     PluginField("vweight",vWeight.values,PluginFieldType::kFLOAT32,(int32_t)vWeight.count),
@@ -169,7 +179,7 @@ ITensor* SrcAttention(
   std::vector<ITensor*> vit{ q,encoder };
   auto bottom = network->addPluginV2(vit.data(), vit.size(), *plugin)->getOutput(0);
 
-  auto out = FC(network, bottom, odim, odim, prefix + "src_attn.linear_out.");
+  auto out = FC(network, bottom, odim, odim, prefix + ".src_attn.linear_out");
   return out;
 }
 

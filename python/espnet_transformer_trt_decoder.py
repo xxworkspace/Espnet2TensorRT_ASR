@@ -11,51 +11,39 @@ from util import src_attention
 from util import position_wise
 from util import final_slice
 
-parser = argparse.ArgumentParser(description="Espnet Encoder Parameters!")
-parser.add_argument("--batchsize",type = int,default=1,help="max batch size!")
-parser.add_argument("--idim",type = int,default=83,help="input feature dimension!")
-parser.add_argument("--odim",type = int,default=256,help="output feature dimension!")
-parser.add_argument("--feed_forward",type = int,default=2048,help="feed forward dimension!")
-parser.add_argument("--layers",type = int,default=12,help="attention layers!")
-parser.add_argument("--attn_head",type = int,default=4,help="attention layers!")
-parser.add_argument("--nvocab",type = int,default=7244,help="the number of vocabularies!")
-parser.add_argument("--dtype",type = int,default=0,help="compute data type!")
-parser.add_argument("--normalize_before",type = bool,default=True,help="layer normalization before!")
-parser.add_argument("--concat_after",type = bool,default=True,help="layer concat!")
-
-args = parser.parse_args()
-
-
-def PositionalEncoding(network,input,model_dict,configure):
+def PositionalEncoding(network,input,configure,model_dict):
   embedding = network.add_constant(shape=(configure.nvocab,configure.odim),model_dict["decoder.embed.0.weight"]).get_output(0)
   gather = network.add_gather(embedding,input,0).get_output(0)
   position = position_wise(network,input,configure.maxseql,configure.odim,configure.dtype,model_dict,"decoder.embed.1.pe")
 
   return position
 
-def DecoderLayer(network,input,encoder,model_dict,prefix,configure):
+def DecoderLayer(network,input,encoder,configure,model_dict,prefix):
   tmp = input
   if configure.normalize_before:
     tmp = layer_normalization(network, tmp,
-    configure.odim, model_dict, prefix + "norm1.")
+    configure.odim, model_dict, prefix + ".norm1")
+
   self = self_attention(network, tmp, configure.n_Head,
     configure.odim, model_dict, prefix)
+
   if configure.concat_after:
     concat = network.add_concatenation([tmp,self]).get_output(0)
     fc = FC(network, concat, configure.odim,
       configure.feed_forward, model_dict, prefix + ".concat_linear1")
-    tmp = network.add_elementwise(fc,input,trt.ElementWiseOperation.SUM).get_output(0)
+    tmp = network.add_elementwise(input,fc,trt.ElementWiseOperation.SUM).get_output(0)
   else:
-    tmp = network.add_elementwise(self,input,trt.ElementWiseOperation.SUM).get_output(0)
+    tmp = network.add_elementwise(input,self,trt.ElementWiseOperation.SUM).get_output(0)
 
   if not configure.normalize_before:
     tmp = layer_normalization(network, tmp,
-    configure.odim, model_dict, prefix + "norm1")
+    configure.odim, model_dict, prefix + ".norm1")
 
   input = tmp
   if configure.normalize_before:
     tmp = layer_normalization(network, tmp,
-    configure.odim, model_dict, prefix + "norm2")
+    configure.odim, model_dict, prefix + ".norm2")
+
   src = src_attention(network,tmp,encoder,configure.n_Head
     configure.odim, odim.dtype, model_dict, prefix)
 
@@ -63,9 +51,9 @@ def DecoderLayer(network,input,encoder,model_dict,prefix,configure):
     concat = network.add_concatenation([tmp,src]).get_output(0)
     fc = FC(network, concat, configure.odim,
       configure.feed_forward, model_dict, prefix + ".concat_linear2")
-    tmp = network.add_elementwise(fc,input,trt.ElementWiseOperation.SUM).get_output(0)
+    tmp = network.add_elementwise(input,fc,trt.ElementWiseOperation.SUM).get_output(0)
   else:
-    tmp = network.add_elementwise(src,input,trt.ElementWiseOperation.SUM).get_output(0)
+    tmp = network.add_elementwise(input,src,trt.ElementWiseOperation.SUM).get_output(0)
   
   if not configure.normalize_before:
     tmp = layer_normalization(network, tmp,
@@ -79,15 +67,15 @@ def DecoderLayer(network,input,encoder,model_dict,prefix,configure):
   tmp = feed_forward(network, tmp, configure.odim,
     configure.feed_forward, model_dict, prefix)
   tmp = network.add_elementwise(tmp,input,trt.ElementWiseOperation.SUM).get_output(0)
-  if configure.normalize_before:
+  if not configure.normalize_before:
     tmp = layer_normalization(network, tmp,
       configure.odim, model_dict, prefix + ".norm3")
   return tmp
 
-def DecoderLayers(network,input,encoder,model_dict,configure):
-  for i in range(configure.layers):
-    input = DecoderLayer(network,input,encoder,model_dict,
-	"decoder.decoders." + str(i),configure)
+def DecoderLayers(network,input,encoder,configure,model_dict):
+  for i in range(configure.decoder_layers):
+    input = DecoderLayer(network, input, encoder, configure,
+	model_dict, "decoder.decoders." + str(i))
   return input
 
 def Espnet_TRT_Transformer_Decoder(configure):
@@ -99,16 +87,17 @@ def Espnet_TRT_Transformer_Decoder(configure):
   input = network.add_input("words",dtype = trt.DataType.INT32,shape=(-1))
   encoder = network.add_input("encoder",dtype = configure.dtype,shape=(-1,configure.odim))
   
-  bottom = PositionalEncoding(network,input,model_dict,configure)
-  bottom = DecoderLayers(network,bottom,encoder,model_dict,configure)
-
+  bottom = PositionalEncoding(network,input,configure,model_dict)
+  bottom = DecoderLayers(network,bottom,encoder,configure,model_dict)
   finalslice = final_slice(network,bottom)
+  shuffle = network.add_shuffle(finalslice)
+  shuffle.reshape_dims = (1,configure.odim)
   if configure.normalize_before:
-    bottom = layer_normalization(network, finalslice,
+    bottom = layer_normalization(network, shuffle.get_output(0),
       configure.odim, model_dict, "decoder.after_norm")
   softmax = network.add_softmax(bottom).get_output(0)
-  topk = network.add_topk(softmax,trt.TopKOperation.MAX,configure.topk,0)
-  prob = topl.get_output(0)
+  topk = network.add_topk(softmax,trt.TopKOperation.MAX,configure.topk,2)
+  prob = topk.get_output(0)
   index = topk.get_output(1)
   prob.set_name("prob")
   index.set_name("index")
@@ -116,3 +105,16 @@ def Espnet_TRT_Transformer_Decoder(configure):
   network.mark_output(prob)
   network.mask_output(index)
   
+  config = builder.create_builder_config()
+  config.set_flag(trt.BuilderFlag.FP16)
+  profile = builder.create_optimization_profile();
+  profile.set_shape("words", (1), (64), (192))
+  profile.set_shape("encoder",(100,configure.odim),(500,configure.odim),(1600,configure.odim))
+  config.add_optimization_profile(profile)
+
+  builder.max_workspace_size = 2**30
+  builder.max_batch_size = configure.batchsize
+  engine = builder.build_engine(network,config)
+
+  with open("", "wb") as f:
+    f.write(engine.serialize())
